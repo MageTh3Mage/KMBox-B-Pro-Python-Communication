@@ -6,6 +6,8 @@
 #include <regstr.h>
 #include <stdio.h>
 #include <string.h>
+#include <errno.h>
+
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "advapi32.lib")
@@ -35,9 +37,9 @@ static char* find_ch340_port(int debug) {
         DWORD size;
         char friendlyName[256] = {0};
         char portName[256] = {0};
-        
+
         if (SetupDiGetDeviceRegistryPropertyA(hDevInfo, &DeviceInfoData, SPDRP_FRIENDLYNAME,
-                                            &DataT, (PBYTE)friendlyName, sizeof(friendlyName), &size)) {
+                                              &DataT, (PBYTE)friendlyName, sizeof(friendlyName), &size)) {
             if (debug) printf("[DEBUG] Found device: %s\n", friendlyName);
             if (strstr(friendlyName, "CH340") || strstr(friendlyName, "USB-SERIAL")) {
                 HKEY hKey = SetupDiOpenDevRegKey(hDevInfo, &DeviceInfoData, DICS_FLAG_GLOBAL, 0, DIREG_DEV, KEY_READ);
@@ -45,14 +47,20 @@ static char* find_ch340_port(int debug) {
                     DWORD len = sizeof(portName);
                     if (RegQueryValueExA(hKey, "PortName", NULL, NULL, (LPBYTE)portName, &len) == ERROR_SUCCESS) {
                         if (portName[0] != '\0') {
-                            HANDLE hTest = CreateFileA(portName, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                                                    OPEN_EXISTING, 0, NULL);
+                            // Construct full path for COM10+
+                            char full_path[64];
+                            snprintf(full_path, sizeof(full_path), "\\\\.\\%s", portName);
+
+                            HANDLE hTest = CreateFileA(full_path, GENERIC_READ | GENERIC_WRITE, 0, NULL,
+                                                       OPEN_EXISTING, 0, NULL);
                             if (hTest != INVALID_HANDLE_VALUE) {
                                 CloseHandle(hTest);
                                 found_port = _strdup(portName);
                                 if (debug) printf("[INFO] Found compatible device on %s\n", found_port);
                                 RegCloseKey(hKey);
                                 break;
+                            } else {
+                                if (debug) printf("[WARN] Failed to open test port: %s\n", full_path);
                             }
                         }
                     }
@@ -70,7 +78,8 @@ static int Kmbox_init(KmboxObject *self, PyObject *args, PyObject *kwds) {
     const char *port = NULL;
     int baudrate = 115200;
     int debug = 0;
-    char* found_port = NULL;
+    char *found_port = NULL;
+    char full_port_path[64] = {0};
 
     static char *kwlist[] = {"port", "baudrate", "debug", NULL};
     if (!PyArg_ParseTupleAndKeywords(args, kwds, "|sip", kwlist, &port, &baudrate, &debug))
@@ -79,10 +88,11 @@ static int Kmbox_init(KmboxObject *self, PyObject *args, PyObject *kwds) {
     self->debug = debug;
     self->is_connected = 0;
 
+    // Auto-discover CH340 device
     if (port == NULL || strcmp(port, "") == 0) {
         if (self->debug) printf("[INFO] Searching for CH340 device...\n");
         found_port = find_ch340_port(self->debug);
-        if (found_port == NULL) {
+        if (!found_port) {
             if (self->debug) printf("[ERROR] No compatible CH340 device found\n");
             PyErr_SetString(PyExc_IOError, "No compatible CH340 device found");
             return -1;
@@ -90,14 +100,29 @@ static int Kmbox_init(KmboxObject *self, PyObject *args, PyObject *kwds) {
         port = found_port;
     }
 
-    self->hSerial = CreateFileA(port, GENERIC_READ | GENERIC_WRITE, 0, NULL,
-                              OPEN_EXISTING, 0, NULL);
+    // Ensure full device path format for COM10+ and still valid for COM1–9
+    snprintf(full_port_path, sizeof(full_port_path), "\\\\.\\%s", port);
+
+    if (self->debug) printf("[DEBUG] Attempting to open: %s\n", full_port_path);
+
+    self->hSerial = CreateFileA(
+        full_port_path,
+        GENERIC_READ | GENERIC_WRITE,
+        0,
+        NULL,
+        OPEN_EXISTING,
+        0,
+        NULL
+    );
 
     if (found_port) free(found_port);
 
     if (self->hSerial == INVALID_HANDLE_VALUE) {
-        if (self->debug) printf("Failed to open port: %s\n", port);
-        PyErr_Format(PyExc_IOError, "Failed to open port: %s", port);
+        DWORD err = GetLastError();
+        if (self->debug) {
+            printf("[ERROR] CreateFileA failed: %s (error code: %lu)\n", full_port_path, err);
+        }
+        PyErr_Format(PyExc_IOError, "Failed to open port: %s (error %lu)", port, err);
         return -1;
     }
 
@@ -127,12 +152,11 @@ static int Kmbox_init(KmboxObject *self, PyObject *args, PyObject *kwds) {
     timeouts.ReadTotalTimeoutMultiplier = 10;
     timeouts.WriteTotalTimeoutConstant = 50;
     timeouts.WriteTotalTimeoutMultiplier = 10;
+
     SetCommTimeouts(self->hSerial, &timeouts);
 
     self->is_connected = 1;
-    if (self->debug)
-        printf("[INFO] Connected to %s\n", port);
-
+    if (self->debug) printf("[INFO] Successfully connected to %s\n", port);
     return 0;
 }
 
